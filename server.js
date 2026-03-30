@@ -21,17 +21,25 @@ const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 
 const mongoose = require("mongoose");
+mongoose.set("bufferCommands", false);
 
-async function connectDB() {
+async function startServer() {
     try {
         await mongoose.connect(process.env.MONGO_URI);
         console.log("MongoDB Connected ✅");
+
+        app.listen(process.env.PORT || 3000, () => {
+            console.log("Server running 🚀");
+        });
+
     } catch (err) {
-        console.error("MongoDB Error:", err.message);
+        console.error("DB Connection Error:", err.message);
     }
 }
 
-connectDB();
+startServer();
+
+
 
 const messageSchema = new mongoose.Schema({
     sender: String,
