@@ -162,6 +162,7 @@ app.post("/whatsapp", async (req, res) => {
                 }
             });
 
+            // Upload to Cloudinary
             const uploadResult = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream(
                     { folder: "whatsapp_images" },
@@ -173,36 +174,22 @@ app.post("/whatsapp", async (req, res) => {
                 response.data.pipe(stream);
             });
 
+            // 🔥 MUST ADD THIS
             const publicUrl = uploadResult.secure_url;
 
-            // ✅ Send to Slack
+            // Send to Slack
             await axios.post(SLACK_WEBHOOK_URL, {
-                text: `📸 Image from ${from}\n${publicUrl}`
+                text: `📸 Image from ${from}`,
+                attachments: [
+                    {
+                        image_url: publicUrl
+                    }
+                ]
             });
 
-            // ✅ Save to DB
+            // Save to DB
             await Message.create({
                 sender: "WhatsApp",
-                from: from,
-                mediaUrl: publicUrl
-            });
-
-        } else {
-            // ✅ Send to Slack
-
-            await axios.post(SLACK_WEBHOOK_URL, {
-                text: `📱 ${from}: ${message}`
-            });
-
-            // ✅ Save to DB
-            await Message.create({
-                sender: "WhatsApp",
-                from: from,
-                message: message
-            });
-
-            await Message.create({
-                sender: "Slack",
                 mediaUrl: publicUrl
             });
         }
