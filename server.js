@@ -27,7 +27,7 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// ✅ FIX 5: Define schema & model BEFORE startServer()
+// ✅ Schema & model defined BEFORE startServer()
 mongoose.set("bufferCommands", false);
 
 const messageSchema = new mongoose.Schema({
@@ -43,7 +43,7 @@ const messageSchema = new mongoose.Schema({
 
 const Message = mongoose.model("Message", messageSchema);
 
-// ✅ FIX 1: Only ONE app.listen() — inside startServer()
+// ✅ Only ONE app.listen() — inside startServer()
 async function startServer() {
     try {
         await mongoose.connect(process.env.MONGO_URI);
@@ -62,6 +62,30 @@ async function startServer() {
 startServer();
 
 // ─────────────────────────────────────────────
+// 🔍 Test route — visit /test-slack in browser
+// ─────────────────────────────────────────────
+app.get("/test-slack", async (req, res) => {
+    try {
+        console.log("SLACK_WEBHOOK_URL:", process.env.SLACK_WEBHOOK_URL ? "✅ Set" : "❌ UNDEFINED");
+
+        if (!process.env.SLACK_WEBHOOK_URL) {
+            return res.send("❌ SLACK_WEBHOOK_URL is NOT set in Railway environment variables.");
+        }
+
+        const slackRes = await axios.post(process.env.SLACK_WEBHOOK_URL, {
+            text: "🔧 Test message from WhatsApp-Slack bridge"
+        });
+
+        console.log("✅ Slack test response:", slackRes.status, slackRes.data);
+        res.send(`✅ Slack response: ${slackRes.status} | ${slackRes.data}`);
+
+    } catch (error) {
+        console.error("❌ Slack test FAILED:", error.response?.status, error.response?.data, error.message);
+        res.send(`❌ Slack ERROR: ${error.response?.status} | ${error.response?.data} | ${error.message}`);
+    }
+});
+
+// ─────────────────────────────────────────────
 // 📩 WhatsApp → Slack (TEXT + IMAGE)
 // ─────────────────────────────────────────────
 app.post("/whatsapp", async (req, res) => {
@@ -69,46 +93,76 @@ app.post("/whatsapp", async (req, res) => {
     const from = req.body.From;
     const numMedia = parseInt(req.body.NumMedia);
 
-    console.log("WhatsApp message from:", from, "| text:", message, "| media count:", numMedia);
+    console.log("📱 WhatsApp from:", from, "| text:", message, "| media:", numMedia);
 
-    // Send 200 to Twilio immediately
+    // Respond to Twilio immediately
     res.send("OK");
 
     try {
         if (numMedia > 0) {
-            // 📸 IMAGE: Download from Twilio → Upload to Cloudinary → Forward to Slack
+            // ─────────────────────────────────────────
+            // 📸 IMAGE
+            // ─────────────────────────────────────────
             const mediaUrl = req.body.MediaUrl0;
+            const mediaContentType = req.body.MediaContentType0 || "image/jpeg";
 
+            console.log("📸 Media URL:", mediaUrl);
+            console.log("📸 Media Type:", mediaContentType);
+
+            // Download as arraybuffer (more reliable than stream for Cloudinary)
             const response = await axios({
                 url: mediaUrl,
                 method: "GET",
-                responseType: "stream",
+                responseType: "arraybuffer",
                 auth: {
                     username: accountSid,
                     password: authToken
                 }
             });
 
+            console.log("📥 Download status:", response.status);
+
+            // Upload buffer directly using .end() instead of .pipe()
             const uploadResult = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    { folder: "whatsapp_images" },
+                cloudinary.uploader.upload_stream(
+                    {
+                        folder: "whatsapp_images",
+                        resource_type: "image"
+                    },
                     (error, result) => {
-                        if (error) reject(error);
-                        else resolve(result);
+                        if (error) {
+                            console.error("❌ Cloudinary upload error:", error.message);
+                            reject(error);
+                        } else {
+                            resolve(result);
+                        }
                     }
-                );
-                response.data.pipe(stream);
+                ).end(response.data);
             });
 
             const publicUrl = uploadResult.secure_url;
+            console.log("☁️ Cloudinary public URL:", publicUrl);
 
-            // Send image to Slack
-            await axios.post(SLACK_WEBHOOK_URL, {
-                text: `📸 Image from *${from}*`,
-                attachments: [{ image_url: publicUrl }]
+            // Use Slack "blocks" format so image renders visually
+            const slackRes = await axios.post(SLACK_WEBHOOK_URL, {
+                blocks: [
+                    {
+                        type: "section",
+                        text: {
+                            type: "mrkdwn",
+                            text: `📸 *Image from ${from}*`
+                        }
+                    },
+                    {
+                        type: "image",
+                        image_url: publicUrl,
+                        alt_text: "WhatsApp image"
+                    }
+                ]
             });
 
-            // Save to DB
+            console.log("📨 Slack image response:", slackRes.status, slackRes.data);
+
             await Message.create({
                 sender: "WhatsApp",
                 from,
@@ -118,12 +172,23 @@ app.post("/whatsapp", async (req, res) => {
             console.log("WhatsApp image → Slack ✅");
 
         } else {
-            // ✅ FIX 2: TEXT case was completely missing — now forwarded to Slack
-            if (!message) return;
+            // ─────────────────────────────────────────
+            // 💬 TEXT
+            // ─────────────────────────────────────────
+            if (!message) {
+                console.log("⚠️ Empty message body, skipping.");
+                return;
+            }
 
-            await axios.post(SLACK_WEBHOOK_URL, {
+            const slackRes = await axios.post(SLACK_WEBHOOK_URL, {
                 text: `💬 *${from}*: ${message}`
             });
+
+            console.log("📨 Slack text response:", slackRes.status, slackRes.data);
+
+            if (slackRes.data !== "ok") {
+                console.error("⚠️ Slack returned unexpected response:", slackRes.data);
+            }
 
             await Message.create({
                 sender: "WhatsApp",
@@ -135,7 +200,10 @@ app.post("/whatsapp", async (req, res) => {
         }
 
     } catch (error) {
-        console.error("WhatsApp → Slack error:", error.message);
+        console.error("❌ WhatsApp → Slack error:");
+        console.error("   Status:", error.response?.status);
+        console.error("   Body:", error.response?.data);
+        console.error("   Message:", error.message);
     }
 });
 
@@ -153,7 +221,7 @@ app.post("/slack", async (req, res) => {
     try {
         if (!text) return;
 
-        // Detect image URL
+        // Detect if text is an image URL
         const isImage = /\.(jpeg|jpg|png|gif)($|\?)/i.test(text) || text.startsWith("http");
 
         if (isImage) {
@@ -207,7 +275,6 @@ app.post("/slack/events", async (req, res) => {
 
     const event = body.event;
 
-    // ✅ FIX 3 & 4: Send image to WhatsApp (not back to Slack), single DB save
     if (event && event.files && event.files.length > 0) {
         const file = event.files[0];
         const fileUrl = file.url_private;
@@ -215,38 +282,41 @@ app.post("/slack/events", async (req, res) => {
         console.log("Slack file received:", fileUrl);
 
         try {
-            // Download image from Slack (requires Bot Token for private URLs)
+            // Download image from Slack using Bot Token
             const response = await axios({
                 url: fileUrl,
                 method: "GET",
-                responseType: "stream",
+                responseType: "arraybuffer",
                 headers: {
                     Authorization: `Bearer ${SLACK_BOT_TOKEN}`
                 }
             });
 
-            // Upload to Cloudinary to get a public URL
+            // Upload to Cloudinary
             const uploadResult = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    { folder: "slack_images" },
+                cloudinary.uploader.upload_stream(
+                    {
+                        folder: "slack_images",
+                        resource_type: "image"
+                    },
                     (error, result) => {
                         if (error) reject(error);
                         else resolve(result);
                     }
-                );
-                response.data.pipe(stream);
+                ).end(response.data);
             });
 
             const publicUrl = uploadResult.secure_url;
+            console.log("☁️ Cloudinary URL:", publicUrl);
 
-            // ✅ FIX 3: Send to WhatsApp via Twilio (was incorrectly posting back to Slack)
+            // Send to WhatsApp via Twilio
             await client.messages.create({
                 from: "whatsapp:+14155238886",
                 to: "whatsapp:+918459679367",
                 mediaUrl: [publicUrl]
             });
 
-            // ✅ FIX 4: Single save with correct sender (was saving twice with wrong senders)
+            // Single save with correct sender
             await Message.create({
                 sender: "Slack",
                 mediaUrl: publicUrl
@@ -260,9 +330,7 @@ app.post("/slack/events", async (req, res) => {
     }
 });
 
-// ✅ Health check route
+// ✅ Health check
 app.get("/", (req, res) => {
     res.send("WhatsApp ↔ Slack Bridge is running ✅");
 });
-
-// ✅ FIX 1: REMOVED the duplicate app.listen() that was here originally
