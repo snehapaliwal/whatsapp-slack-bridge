@@ -56,9 +56,9 @@ const Message = mongoose.model("Message", messageSchema);
 
 // ☁️ Cloudinary config
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
 app.post("/slack/events", async (req, res) => {
@@ -99,7 +99,7 @@ app.post("/slack/events", async (req, res) => {
             // 🔥 Step 5: Upload to Cloudinary
             const uploadResult = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream(
-                    { folder: "slack_images" },
+                    { folder: "whatsapp_images" },
                     (error, result) => {
                         if (error) reject(error);
                         else resolve(result);
@@ -108,15 +108,23 @@ app.post("/slack/events", async (req, res) => {
                 response.data.pipe(stream);
             });
 
+            // 🔥 IMPORTANT LINE
             const publicUrl = uploadResult.secure_url;
 
-            console.log("Cloudinary URL:", publicUrl);
+            // send to Slack
+            await axios.post(SLACK_WEBHOOK_URL, {
+                text: `📸 Image from ${from}`,
+                attachments: [
+                    {
+                        image_url: publicUrl
+                    }
+                ]
+            });
 
-            // 🔥 Step 6: Send to WhatsApp
-            await client.messages.create({
-                from: "whatsapp:+14155238886",
-                to: "whatsapp:+918459679367",
-                mediaUrl: [publicUrl]
+            // save to DB
+            await Message.create({
+                sender: "WhatsApp",
+                mediaUrl: publicUrl
             });
 
             console.log("Image sent to WhatsApp 📸");
