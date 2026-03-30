@@ -36,6 +36,7 @@ mongoose.set("bufferCommands", false);
 const messageSchema = new mongoose.Schema({
     sender: String,
     from: String,
+    fromName: String,        // ✅ NEW: display name
     message: String,
     mediaUrl: String,
     slackChannel: String,
@@ -44,16 +45,15 @@ const messageSchema = new mongoose.Schema({
 const Message = mongoose.model("Message", messageSchema);
 
 // ─────────────────────────────────────────────
-// 📦 SCHEMA 2: Bridges (NEW)
-// Stores which WhatsApp number is connected
-// to which Slack channel
+// 📦 SCHEMA 2: Bridges
 // ─────────────────────────────────────────────
 const bridgeSchema = new mongoose.Schema({
-    slackChannel: { type: String, required: true },   // e.g. C0APMTNQKUY
-    slackChannelName: { type: String },                // e.g. new-channel
-    whatsappNumber: { type: String, required: true },  // e.g. whatsapp:+918459679367
-    invitedBy: { type: String },                       // Slack user ID
-    status: { type: String, default: "active" },       // active / removed
+    slackChannel: { type: String, required: true },
+    slackChannelName: { type: String },
+    whatsappNumber: { type: String, required: true },
+    name: { type: String, default: null },   // ✅ NEW: display name
+    invitedBy: { type: String },
+    status: { type: String, default: "active" },
     createdAt: { type: Date, default: Date.now }
 });
 const Bridge = mongoose.model("Bridge", bridgeSchema);
@@ -87,21 +87,27 @@ function convertSlackEmojis(text) {
 }
 
 // ─────────────────────────────────────────────
-// 🔧 Helper: get all active WA numbers for a channel
+// 🔧 Helper: get display label for a WA number
+// Returns "Sneha Paliwal (+918459679367)"
+// or just "+918459679367" if no name saved
+// ─────────────────────────────────────────────
+function formatSender(bridge) {
+    const number = bridge.whatsappNumber.replace("whatsapp:", "");
+    if (bridge.name && bridge.name.trim() !== "") {
+        return `${bridge.name} (${number})`;
+    }
+    return number;
+}
+
+// ─────────────────────────────────────────────
+// 🔧 Helpers
 // ─────────────────────────────────────────────
 async function getActiveBridges(slackChannel) {
     return await Bridge.find({ slackChannel, status: "active" });
 }
 
-// ─────────────────────────────────────────────
-// 🔧 Helper: find which channel a WA number belongs to
-// ─────────────────────────────────────────────
-async function getChannelForNumber(whatsappNumber) {
-    const bridge = await Bridge.findOne({
-        whatsappNumber,
-        status: "active"
-    });
-    return bridge ? bridge.slackChannel : null;
+async function getBridgeForNumber(whatsappNumber) {
+    return await Bridge.findOne({ whatsappNumber, status: "active" });
 }
 
 // ─────────────────────────────────────────────
@@ -141,11 +147,11 @@ app.get("/test-slack", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // 📩 WhatsApp → Slack (TEXT + IMAGE)
-// Now dynamically finds the correct Slack channel
+// Shows name instead of number in Slack
 // ─────────────────────────────────────────────
 app.post("/whatsapp", async (req, res) => {
     const message = req.body.Body;
-    const from = req.body.From;          // e.g. whatsapp:+918459679367
+    const from = req.body.From;
     const numMedia = parseInt(req.body.NumMedia);
 
     console.log("📱 WhatsApp from:", from, "| text:", message, "| media:", numMedia);
@@ -153,16 +159,17 @@ app.post("/whatsapp", async (req, res) => {
     res.send("OK");
 
     try {
-        // Find which Slack channel this number is connected to
-        let slackChannel = await getChannelForNumber(from);
+        // Find bridge for this number
+        const bridge = await getBridgeForNumber(from);
 
-        // Fallback: if number not in DB, use default channel C0APMTNQKUY
-        if (!slackChannel) {
-            console.log("⚠️ Number not found in DB, using default channel");
-            slackChannel = "C0APMTNQKUY";
-        }
+        // ✅ Use name if available, else use number
+        const displayName = bridge
+            ? formatSender(bridge)
+            : from.replace("whatsapp:", "");
 
-        console.log("📤 Sending to Slack channel:", slackChannel);
+        const slackChannel = bridge ? bridge.slackChannel : "C0APMTNQKUY";
+
+        console.log("📤 Sender:", displayName, "| Channel:", slackChannel);
 
         if (numMedia > 0) {
             // ── 📸 IMAGE ──
@@ -186,11 +193,11 @@ app.post("/whatsapp", async (req, res) => {
             });
 
             const publicUrl = uploadResult.secure_url;
-            console.log("☁️ Cloudinary URL:", publicUrl);
 
+            // ✅ Name dikhao number ki jagah
             const captionText = (message && message.trim() !== "")
-                ? `📸 *Image from ${from}*\n${message}`
-                : `📸 *Image from ${from}*`;
+                ? `📸 *Image from ${displayName}*\n${message}`
+                : `📸 *Image from ${displayName}*`;
 
             await axios.post(SLACK_WEBHOOK_URL, {
                 channel: slackChannel,
@@ -210,6 +217,7 @@ app.post("/whatsapp", async (req, res) => {
             await Message.create({
                 sender: "WhatsApp",
                 from,
+                fromName: displayName,
                 message: message || null,
                 mediaUrl: publicUrl,
                 slackChannel
@@ -224,14 +232,16 @@ app.post("/whatsapp", async (req, res) => {
                 return;
             }
 
+            // ✅ Name dikhao number ki jagah
             await axios.post(SLACK_WEBHOOK_URL, {
                 channel: slackChannel,
-                text: `💬 *${from}*: ${message}`
+                text: `💬 *${displayName}*: ${message}`
             });
 
             await Message.create({
                 sender: "WhatsApp",
                 from,
+                fromName: displayName,
                 message,
                 slackChannel
             });
@@ -246,7 +256,7 @@ app.post("/whatsapp", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // 💬 Slack → WhatsApp
-// Now handles: invite / list / remove / message
+// invite / list / remove / name / message
 // ─────────────────────────────────────────────
 app.post("/slack", async (req, res) => {
     const rawText = req.body.text || "";
@@ -260,16 +270,17 @@ app.post("/slack", async (req, res) => {
     const subcommand = parts[0]?.toLowerCase();
 
     // ─────────────────────────────────────────
-    // 📌 /whatsapp invite +91xxxxxxxxxx
+    // 📌 /whatsapp invite +91xxxx Sneha Paliwal
     // ─────────────────────────────────────────
     if (subcommand === "invite") {
         const number = parts[1];
+        // ✅ Name: everything after the number joined together
+        const name = parts.slice(2).join(" ") || null;
 
         if (!number) {
-            return res.send("❌ Usage: `/whatsapp invite +91xxxxxxxxxx`");
+            return res.send("❌ Usage: `/whatsapp invite +91xxxxxxxxxx Name`\nExample: `/whatsapp invite +918459679367 Sneha Paliwal`");
         }
 
-        // Format number properly
         const formatted = number.startsWith("whatsapp:")
             ? number
             : `whatsapp:${number}`;
@@ -285,29 +296,32 @@ app.post("/slack", async (req, res) => {
             return res.send(`⚠️ *${number}* is already connected to this channel!`);
         }
 
-        // Save to DB
+        // Save to DB with name
         await Bridge.create({
             slackChannel,
             slackChannelName,
             whatsappNumber: formatted,
+            name,                    // ✅ name saved here
             invitedBy,
             status: "active"
         });
 
-        console.log("✅ Bridge created:", formatted, "→", slackChannel);
+        console.log("✅ Bridge created:", formatted, "name:", name, "→", slackChannel);
 
         // Send welcome message to WhatsApp
         try {
+            const greeting = name ? `Hi ${name.split(" ")[0]}!` : "Hi!";
             await client.messages.create({
                 from: TWILIO_WHATSAPP_FROM,
                 to: formatted,
-                body: `👋 You have been invited to join a Slack channel (#${slackChannelName}). You can now send and receive messages here!`
+                body: `👋 ${greeting} You have been invited to join a Slack channel (#${slackChannelName}). You can now send and receive messages here!`
             });
         } catch (err) {
             console.error("⚠️ Could not send WhatsApp invite message:", err.message);
         }
 
-        return res.send(`✅ *${number}* invited successfully! They are now connected to *#${slackChannelName}*`);
+        const displayName = name ? `*${name}* (${number})` : `*${number}*`;
+        return res.send(`✅ ${displayName} invited successfully! They are now connected to *#${slackChannelName}*`);
     }
 
     // ─────────────────────────────────────────
@@ -317,12 +331,18 @@ app.post("/slack", async (req, res) => {
         const bridges = await getActiveBridges(slackChannel);
 
         if (bridges.length === 0) {
-            return res.send("📋 No WhatsApp numbers connected to this channel yet.\nUse `/whatsapp invite +91xxxxxxxxxx` to add someone.");
+            return res.send(
+                "📋 No WhatsApp numbers connected to this channel yet.\n" +
+                "Use `/whatsapp invite +91xxxxxxxxxx Name` to add someone."
+            );
         }
 
-        const list = bridges.map((b, i) =>
-            `${i + 1}. ${b.whatsappNumber.replace("whatsapp:", "")} _(connected ${new Date(b.createdAt).toLocaleDateString()})_`
-        ).join("\n");
+        const list = bridges.map((b, i) => {
+            const number = b.whatsappNumber.replace("whatsapp:", "");
+            const nameStr = b.name ? ` — *${b.name}*` : "";
+            const date = new Date(b.createdAt).toLocaleDateString();
+            return `${i + 1}. ${number}${nameStr} _(connected ${date})_`;
+        }).join("\n");
 
         return res.send(`📋 *Connected WhatsApp numbers in #${slackChannelName}:*\n${list}`);
     }
@@ -350,30 +370,59 @@ app.post("/slack", async (req, res) => {
             return res.send(`⚠️ *${number}* is not connected to this channel.`);
         }
 
-        // Notify the WhatsApp user
         try {
             await client.messages.create({
                 from: TWILIO_WHATSAPP_FROM,
                 to: formatted,
-                body: `👋 You have been removed from the Slack channel #${slackChannelName}. You will no longer receive messages from this channel.`
+                body: `👋 You have been removed from the Slack channel #${slackChannelName}.`
             });
         } catch (err) {
             console.error("⚠️ Could not send removal notification:", err.message);
         }
 
-        console.log("✅ Bridge removed:", formatted, "from", slackChannel);
-        return res.send(`✅ *${number}* has been removed from *#${slackChannelName}*`);
+        const removedName = bridge.name ? `*${bridge.name}* (${number})` : `*${number}*`;
+        return res.send(`✅ ${removedName} has been removed from *#${slackChannelName}*`);
+    }
+
+    // ─────────────────────────────────────────
+    // ✏️ /whatsapp name +91xxxx New Name
+    // Update name of existing contact
+    // ─────────────────────────────────────────
+    if (subcommand === "name") {
+        const number = parts[1];
+        const newName = parts.slice(2).join(" ");
+
+        if (!number || !newName) {
+            return res.send("❌ Usage: `/whatsapp name +91xxxxxxxxxx New Name`\nExample: `/whatsapp name +918459679367 Sneha Paliwal`");
+        }
+
+        const formatted = number.startsWith("whatsapp:")
+            ? number
+            : `whatsapp:${number}`;
+
+        const bridge = await Bridge.findOneAndUpdate(
+            { slackChannel, whatsappNumber: formatted, status: "active" },
+            { name: newName },
+            { new: true }
+        );
+
+        if (!bridge) {
+            return res.send(`⚠️ *${number}* is not connected to this channel. Invite them first.`);
+        }
+
+        return res.send(`✅ Name updated! *${number}* will now show as *${newName}* in Slack.`);
     }
 
     // ─────────────────────────────────────────
     // ❓ /whatsapp help
     // ─────────────────────────────────────────
-    if (subcommand === "help" || subcommand === "") {
+    if (subcommand === "help" || rawText.trim() === "") {
         return res.send(
             `*WhatsApp Bridge Commands:*\n` +
-            `• \`/whatsapp invite +91xxxxxxxxxx\` — Connect a WhatsApp number to this channel\n` +
+            `• \`/whatsapp invite +91xxxxxxxxxx Name\` — Connect a number (name optional)\n` +
             `• \`/whatsapp list\` — See all connected numbers\n` +
             `• \`/whatsapp remove +91xxxxxxxxxx\` — Disconnect a number\n` +
+            `• \`/whatsapp name +91xxxxxxxxxx New Name\` — Update contact name\n` +
             `• \`/whatsapp [message]\` — Send a message to all connected numbers`
         );
     }
@@ -384,15 +433,12 @@ app.post("/slack", async (req, res) => {
     const text = convertSlackEmojis(rawText);
     console.log("Slack message → WhatsApp:", text);
 
-    // Respond to Slack immediately
     res.send("Sending to WhatsApp... ✅");
 
     try {
-        // Get all active bridges for this channel
         const bridges = await getActiveBridges(slackChannel);
 
         if (bridges.length === 0) {
-            // No bridges — fallback to original hardcoded number
             console.log("⚠️ No bridges found, using fallback number");
             await client.messages.create({
                 from: TWILIO_WHATSAPP_FROM,
@@ -403,7 +449,6 @@ app.post("/slack", async (req, res) => {
             return;
         }
 
-        // Send to ALL connected numbers
         for (const bridge of bridges) {
             try {
                 const isImage = /\.(jpeg|jpg|png|gif)($|\?)/i.test(text);
@@ -414,25 +459,17 @@ app.post("/slack", async (req, res) => {
                         to: bridge.whatsappNumber,
                         mediaUrl: [text]
                     });
-                    await Message.create({
-                        sender: "Slack",
-                        mediaUrl: text,
-                        slackChannel
-                    });
+                    await Message.create({ sender: "Slack", mediaUrl: text, slackChannel });
                 } else {
                     await client.messages.create({
                         from: TWILIO_WHATSAPP_FROM,
                         to: bridge.whatsappNumber,
                         body: text
                     });
-                    await Message.create({
-                        sender: "Slack",
-                        message: text,
-                        slackChannel
-                    });
+                    await Message.create({ sender: "Slack", message: text, slackChannel });
                 }
 
-                console.log(`✅ Sent to ${bridge.whatsappNumber}`);
+                console.log(`✅ Sent to ${bridge.whatsappNumber} (${bridge.name || "no name"})`);
 
             } catch (err) {
                 console.error(`❌ Failed to send to ${bridge.whatsappNumber}:`, err.message);
@@ -485,13 +522,10 @@ app.post("/slack/events", async (req, res) => {
             });
 
             const publicUrl = uploadResult.secure_url;
-            console.log("☁️ Cloudinary URL:", publicUrl);
 
-            // Send to all active bridges for this channel
             const bridges = await getActiveBridges(slackChannel);
 
             if (bridges.length === 0) {
-                // Fallback to default number
                 await client.messages.create({
                     from: TWILIO_WHATSAPP_FROM,
                     to: "whatsapp:+918459679367",
@@ -508,12 +542,7 @@ app.post("/slack/events", async (req, res) => {
                 }
             }
 
-            await Message.create({
-                sender: "Slack",
-                mediaUrl: publicUrl,
-                slackChannel
-            });
-
+            await Message.create({ sender: "Slack", mediaUrl: publicUrl, slackChannel });
             console.log("Slack image → WhatsApp ✅");
 
         } catch (error) {
